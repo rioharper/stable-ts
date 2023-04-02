@@ -284,28 +284,6 @@ class Segment:
 
         return sorted(set(indices) - set(self.get_locked_indices()))
 
-    def get_length_indices(self, max_chars: int = None, max_words: int = None):  # for splitting
-        if max_chars is None and max_words is None:
-            return []
-        assert max_chars != 0 and max_words != 0, \
-            f'max_chars and max_words must be greater 0, but got {max_chars} and {max_words}'
-        indices = []
-        curr_words = 0
-        curr_chars = 0
-        for i, word in enumerate(self.words):
-            curr_words += 1
-            curr_chars += len(word)
-            if i != 0:
-                if (
-                        max_chars is not None and curr_chars > max_chars
-                        or
-                        max_words is not None and curr_words > max_words
-                ):
-                    indices.append(i-1)
-                    curr_words = 1
-                    curr_chars = len(word)
-        return indices
-
     def split(self, indices: List[int]):
         if len(indices) == 0:
             return []
@@ -494,34 +472,47 @@ class WhisperResult:
             warnings.warn('Found segment(s) without word timings. These segment(s) cannot be split.')
         self.remove_no_word_segments()
 
-    def _merge_segments(self, indices: List[int],
-                        *, max_words: int = None, max_chars: int = None, is_sum_max: bool = False, lock: bool = False):
-        if len(indices) == 0:
-            return
+    def _merge_segments(self, get_indices, args: list = None,
+                        *, max_words: int = None, min_words: int = None, max_chars: int = None, is_sum_max: bool = False, lock: bool = False):
+        if args is None:
+            args = []
+        indices = get_indices(*args)
         for i in reversed(indices):
             seg = self.segments[i]
             if (
+                # Check if max_words is set and if the sum of word counts of current and next segment exceed the limit
+                (
+                    max_words and
+                    seg.has_words and
                     (
-                            max_words and
-                            seg.has_words and
-                            (
-                                    (seg.word_count() + self.segments[i + 1].word_count() > max_words)
-                                    if is_sum_max else
-                                    (seg.word_count() > max_words and self.segments[i + 1].word_count() > max_words)
-                            )
-                    ) or
-                    (
-                            max_chars and
-                            (
-                                    (seg.char_count() + self.segments[i + 1].char_count() > max_chars)
-                                    if is_sum_max else
-                                    (seg.char_count() > max_chars and self.segments[i + 1].char_count() > max_chars)
-                            )
+                        (seg.word_count() + self.segments[i + 1].word_count() > max_words) if is_sum_max else
+                        (seg.word_count() > max_words and self.segments[i + 1].word_count() > max_words)
                     )
+                ) or
+                # Check if max_chars is set and if the sum of character counts of current and next segment exceed the limit
+                (
+                    max_chars and
+                    (
+                        (seg.char_count() + self.segments[i + 1].char_count() > max_chars) if is_sum_max else
+                        (seg.char_count() > max_chars and self.segments[i + 1].char_count() > max_chars)
+                    )
+                )
             ):
+                # If the segment doesn't meet the criteria, skip to the next index
                 continue
-            self.add_segments(i, i + 1, inplace=True, lock=lock)
+            # Check if min_words is set and if the segment has fewer words than the limit
+            if min_words and seg.word_count() + self.segments[i + 1].word_count() < min_words:
+                # Keep merging segments until the total word count is at or above min_words
+                while seg.word_count() + self.segments[i + 1].word_count() < min_words:
+                    self.add_segments(i, i + 1, inplace=True, lock=lock)
+                    # Update the segment variable to reflect the merged segment
+                    seg = self.segments[i]
+            else:
+                # Merge current and next segment
+                self.add_segments(i, i + 1, inplace=True, lock=lock)
+        # Remove segments with no words
         self.remove_no_word_segments()
+
 
     def split_by_gap(
             self,
@@ -547,6 +538,7 @@ class WhisperResult:
     def merge_by_gap(
             self,
             min_gap: float = 0.1,
+            min_words: int = None,
             max_words: int = None,
             max_chars: int = None,
             is_sum_max: bool = False,
@@ -562,6 +554,8 @@ class WhisperResult:
             Any gaps below or equal to this value (seconds) will be merged. (Default: 0.1)
         max_words: int
             Maximum number of words allowed. (Default: None)
+        min_words: int
+            Minimum number of words per segment. (Default: None)
         max_chars: int
             Maximum number of characters allowed. (Default: None)
         is_sum_max: bool
@@ -571,9 +565,8 @@ class WhisperResult:
             Whether to prevent future splits/merges from altering changes made by this function. (Default: False)
 
         """
-        indices = self.get_gap_indices(min_gap)
-        self._merge_segments(indices,
-                             max_words=max_words, max_chars=max_chars, is_sum_max=is_sum_max, lock=lock)
+        self._merge_segments(self.get_gap_indices, [min_gap],
+                             max_words=max_words, min_words=min_words, max_chars=max_chars, is_sum_max=is_sum_max, lock=lock)
         return self
 
     def split_by_punctuation(
@@ -622,48 +615,13 @@ class WhisperResult:
             Whether to prevent future splits/merges from altering changes made by this function. (Default: False)
 
         """
-        indices = self.get_punctuation_indices(punctuation)
-        self._merge_segments(indices,
+        self._merge_segments(self.get_punctuation_indices, [punctuation],
                              max_words=max_words, max_chars=max_chars, is_sum_max=is_sum_max, lock=lock)
-        return self
-
-    def merge_all_segments(self):
-        """
-        Merge all segments into one segment.
-        """
-        self._merge_segments(list(range(len(self.segments) - 1)))
-        return self
-
-    def split_by_length(
-            self,
-            max_chars: int = None,
-            max_words: int = None,
-            force_len: bool = False,
-            lock: bool = False
-    ):
-        """
-
-        Parameters
-        ----------
-        max_chars: int
-            Maximum number of character allowed in segment.
-        max_words: int
-            Maximum number of words allowed in segment.
-        force_len: bool
-            Maintain a relatively constant length for each segment. (Default: False)
-            This will ignore all previous non-locked segment boundaries (e.g. boundaries set by `regroup()`).
-        lock: bool
-            Whether to prevent future splits/merges from altering changes made by this function. (Default: False)
-
-        """
-        if force_len:
-            self.merge_all_segments()
-        self._split_segments(lambda x: x.get_length_indices(max_chars=max_chars, max_words=max_words), lock=lock)
         return self
 
     def regroup(self):
         """
-        Regroup (in-place) all words into segments with more natural boundaries without locking.
+        Regroup all words into segments with more natural boundaries. (in-place)
         """
         return (
             self
